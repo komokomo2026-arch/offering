@@ -120,11 +120,33 @@
     .bk-msg { margin-top: 14px; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; word-break: break-word; }
     .bk-err { background: #fef2f2; color: #991b1b; }
     .btn-main[id^="bk"]:disabled { cursor: not-allowed; }
+
+    /* ===== Phone-only: Quick Actions Grid (replaces bottom nav), More menu, Back chevron =====
+       Everything below is hidden by default and only activates at <= 767px (the app's existing phone breakpoint).
+       Tablet / laptop / desktop rules above are untouched. */
+    .qa-more, .qa-menu, .back-chevron { display: none; }
+    @media (max-width: 767px) {
+      body { display: flex; flex-direction: column; padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px)); }
+      .container { order: 2; width: 100%; box-sizing: border-box; margin: 0 auto; }
+      .toast-bottom { bottom: calc(24px + env(safe-area-inset-bottom, 0px)); }
+      #appFooter { display: none; }
+      #quickActions { order: 1; position: relative; bottom: auto; left: auto; right: auto; z-index: 60; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; padding: 14px 6px 8px; background: #fff; border-top: none; border-bottom: 1px solid #e2e8f0; box-shadow: none; }
+      #quickActions .nav-item, #quickActions .qa-more { display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 6px; min-height: 0; padding: 4px 0; margin: 0; background: none; border: 0; font: inherit; font-size: 11px; color: #475569; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+      #quickActions .nav-item i, #quickActions .qa-more i { display: flex; align-items: center; justify-content: center; width: 52px; height: 52px; margin: 0; border-radius: 50%; background: #eff6ff; color: var(--primary); font-size: 21px; transition: 0.2s; }
+      #quickActions .nav-item.active { color: var(--primary); font-weight: bold; }
+      #quickActions .nav-item.active i { background: var(--primary); color: #fff; }
+      #quickActions .qa-more[aria-expanded="true"] i { background: var(--dark); color: #fff; }
+      #quickActions .qa-menu { display: none; position: absolute; top: 100%; left: 10px; right: 10px; margin-top: 6px; z-index: 1; flex-direction: column; gap: 6px; box-sizing: border-box; padding: 8px; background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; box-shadow: 0 10px 25px rgba(15,23,42,0.18); max-height: calc(100vh - 170px); overflow-y: auto; }
+      #quickActions .qa-menu.open { display: flex; }
+      #quickActions .qa-menu .footer-btn { width: 100%; box-sizing: border-box; min-height: 44px; padding: 12px 14px; border-radius: 10px; font-size: 14px; text-align: left; }
+      .back-chevron { position: absolute; left: 0; top: env(safe-area-inset-top, 0px); bottom: 0; width: 48px; align-items: center; justify-content: center; padding: 0 0 4px; background: none; border: 0; color: #fff; font-size: 34px; line-height: 1; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+      body.show-back .back-chevron { display: flex; }
+    }
   </style>
 </head>
 <body>
 
-<div class="header">CHURCH OFFERINGS SYSTEM</div>
+<div class="header"><button type="button" id="backChevron" class="back-chevron" aria-label="Back">‹</button>CHURCH OFFERINGS SYSTEM</div>
 <div id="toast" class="toast-bottom"></div>
 
 <div class="container">
@@ -304,11 +326,13 @@
 </div>
 
 <!-- NAV -->
-<div class="bottom-nav">
+<div class="bottom-nav" id="quickActions" aria-label="Quick actions">
   <div class="nav-item active" onclick="switchView('homeView', this)"><i class="fas fa-chart-line"></i><span>Home</span></div>
   <div class="nav-item" onclick="switchView('addView', this)"><i class="fas fa-plus-circle"></i><span>Add</span></div>
   <div class="nav-item" onclick="switchView('reportsView', this)"><i class="fas fa-file-invoice"></i><span>Reports</span></div>
   <div class="nav-item" onclick="switchView('calcView', this)"><i class="fas fa-calculator"></i><span>Calculator</span></div>
+  <button type="button" class="qa-more" id="qaMore" aria-haspopup="true" aria-expanded="false" aria-controls="qaMenu"><i class="fas fa-ellipsis-h"></i><span>More</span></button>
+  <div id="qaMenu" class="qa-menu"></div>
 </div>
 
 <!-- MODALS -->
@@ -1299,8 +1323,26 @@ const GOOGLE_DRIVE_CONFIG = {
     state.authExpired = false;
     clearTimeout(state.expiryTimer);
     state.expiryTimer = setTimeout(function () { render(); }, Math.max(0, state.expiresAt - Date.now()) + 50);
+    persistSession();
   }
-  function invalidateToken() { state.token = null; state.expiresAt = 0; state.email = ''; clearTimeout(state.expiryTimer); }
+  function invalidateToken() { state.token = null; state.expiresAt = 0; state.email = ''; clearTimeout(state.expiryTimer); clearSession(); }
+  /* The short-lived access token (about 1 hour, drive.file scope only) is kept in sessionStorage ONLY — never in
+     localStorage or backup files, and cleared on disconnect/expiry/when the app session ends — so a page refresh
+     does not force a new Google sign-in while the authorization is still valid. */
+  var SESSION_KEY = 'churchOfferingBackupSession.v1';
+  function persistSession() { try { sessionStorage.setItem(SESSION_KEY, JSON.stringify({ t: state.token, e: state.expiresAt, m: state.email })); } catch (e) {} }
+  function clearSession() { try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {} }
+  function restoreSession() {
+    try {
+      var o = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null');
+      if (o && typeof o.t === 'string' && o.t && Number(o.e) > Date.now() + 30000) {
+        state.token = o.t; state.expiresAt = Number(o.e); state.email = o.m || ''; state.authExpired = false;
+        clearTimeout(state.expiryTimer); state.expiryTimer = setTimeout(render, state.expiresAt - Date.now() + 50);
+        return true;
+      }
+    } catch (e) {}
+    clearSession(); return false;
+  }
   /* One silent renewal attempt only; never loops. Reset by a user-initiated connect. */
   function renewToken() {
     if (state.renewing) return state.renewing;
@@ -1710,7 +1752,7 @@ const GOOGLE_DRIVE_CONFIG = {
      Connect / disconnect
      ========================================================= */
   async function loadAccountInfo() {
-    try { var j = await driveJson(apiUrl(CFG.DRIVE_API_URL, '/about?fields=user(emailAddress,displayName)')); state.email = (j.user && (j.user.emailAddress || j.user.displayName)) || ''; }
+    try { var j = await driveJson(apiUrl(CFG.DRIVE_API_URL, '/about?fields=user(emailAddress,displayName)')); state.email = (j.user && (j.user.emailAddress || j.user.displayName)) || ''; persistSession(); }
     catch (e) { state.email = ''; }
   }
   function onConnectClick() {
@@ -1787,7 +1829,7 @@ const GOOGLE_DRIVE_CONFIG = {
     else if (problem === 'origin') txt = '⚠️ Google sign-in is not available here: it needs the app to be opened from https:// (for example GitHub Pages) or http://localhost, not a local file. The app works normally and all data stays on this device.';
     else if (state.busy === 'connect') txt = 'Connecting to Google…';
     else if (connected) txt = '✅ Connected to Google' + (state.email ? ' as ' + state.email : '') + '.';
-    else if (state.token || state.authExpired) txt = '⚠️ Google authorization expired. Click “Connect to Google” to continue.';
+    else if (state.token || state.authExpired) txt = '⚠️ Your Google authorization expired (Google access lasts about an hour) or was revoked. Tap “Connect to Google” to renew it — your folder and settings are kept.';
     else txt = '❌ Not connected to Google' + (settings.lastAccountEmail ? ' (last used: ' + settings.lastAccountEmail + ')' : '') + '.';
     cs.textContent = txt;
     show('bkConnectBtn', !problem && !connected);
@@ -1839,9 +1881,71 @@ const GOOGLE_DRIVE_CONFIG = {
     $id('bkFolderInput').setAttribute('placeholder', CFG.DEFAULT_FOLDER_NAME);
     window.addEventListener('online', function () { state.retryCount = 0; if (autoCanRun() && needsBackup() && !state.autoBlocked) scheduleAuto(2000); render(); });
     window.addEventListener('offline', render);
+    var restored = restoreSession();
     render();
+    if (restored) {            /* still-valid authorization from this session: stay connected, verify quietly */
+      driveFetch(apiUrl(CFG.DRIVE_API_URL, '/about?fields=user(emailAddress,displayName)'), undefined, false)
+        .then(function (r) { return r.json(); })
+        .then(function (j) { state.email = (j.user && (j.user.emailAddress || j.user.displayName)) || state.email; persistSession(); })
+        .catch(function (e) { if (e && e.kind === 'auth') setMessage('Your Google authorization is no longer valid (it expired or was revoked), so you were disconnected. Tap “Connect to Google” to renew it.'); })
+        .then(function () { render(); resumeAuto(); });
+    }
+    /* Preload Google sign-in once (non-blocking) so the first Connect tap works immediately. */
+    if (!envProblem() && navigator.onLine !== false) setTimeout(function () { if (!gisReady()) loadGis().catch(function () {}); }, 1500);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+</script>
+
+<script>
+/* =========================================================
+   PHONE NAVIGATION HELPERS (<= 767px only)
+   - Moves the existing footer buttons into the "More" menu (same elements, same handlers) on phones
+     and puts them back in the footer on larger screens.
+   - Back chevron: remembers the in-app screens visited through the existing switchView().
+   ========================================================= */
+(function () {
+  var footerWrap = document.querySelector('#appFooter > div');
+  var menu = document.getElementById('qaMenu'), more = document.getElementById('qaMore'), back = document.getElementById('backChevron');
+  if (!footerWrap || !menu || !more || !back || typeof window.switchView !== 'function') return;
+  var mq = window.matchMedia ? window.matchMedia('(max-width: 767px)') : null;
+  var items = Array.prototype.slice.call(footerWrap.children);       /* original footer order */
+  function isPhone() { return mq ? mq.matches : window.innerWidth <= 767; }
+
+  function openMenu() { menu.classList.add('open'); more.setAttribute('aria-expanded', 'true'); }
+  function closeMenu() { menu.classList.remove('open'); more.setAttribute('aria-expanded', 'false'); }
+  function placeFooterButtons() {
+    var target = isPhone() ? menu : footerWrap;
+    items.forEach(function (b) { if (b.parentNode !== target) target.appendChild(b); });
+    if (!isPhone()) closeMenu();
+  }
+  more.addEventListener('click', function (e) { e.stopPropagation(); menu.classList.contains('open') ? closeMenu() : openMenu(); });
+  menu.addEventListener('click', function (e) { if (e.target.closest('button, a')) closeMenu(); });   /* runs after the button's own handler */
+  document.addEventListener('click', function (e) { if (!menu.contains(e.target) && !more.contains(e.target)) closeMenu(); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && menu.classList.contains('open')) { closeMenu(); more.focus(); } });
+  if (mq) { mq.addEventListener ? mq.addEventListener('change', placeFooterButtons) : mq.addListener(placeFooterButtons); }
+  window.addEventListener('resize', placeFooterButtons);
+  placeFooterButtons();
+
+  /* ---- Back chevron (phone only; hidden by CSS elsewhere) ---- */
+  var origSwitch = window.switchView, stack = [];
+  function activeId() { var a = document.querySelector('.view.active'); return a ? a.id : 'homeView'; }
+  function navItemFor(id) { return document.querySelector('.nav-item[onclick*="\'' + id + '\'"]'); }
+  function updateBack() { document.body.classList.toggle('show-back', activeId() !== 'homeView'); }
+  window.switchView = function (id) {
+    var cur = activeId();
+    if (id !== cur) { var i = stack.lastIndexOf(id); if (i >= 0) stack.length = i; else stack.push(cur); }   /* no loops / duplicate history */
+    var r = origSwitch.apply(this, arguments);
+    updateBack();
+    return r;
+  };
+  back.addEventListener('click', function () {
+    var cur = activeId(), prev = stack.length ? stack.pop() : 'homeView';
+    if (prev === cur) prev = 'homeView';
+    origSwitch(prev, navItemFor(prev));      /* original navigation function; forms are only hidden, never reset */
+    updateBack(); closeMenu();
+  });
+  updateBack();
 })();
 </script>
 </body>
