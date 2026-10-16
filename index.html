@@ -1155,9 +1155,39 @@ async function deleteCalcHistoryEntry(id) {
        API_KEY is optional and may be left empty.
      - The "drive.file" scope is the minimum scope for this feature: the app
        can only see files/folders that IT created (or that you opened with it).
-     - Google sign-in only works from https:// pages or http://localhost.
-       It does not work when index.html is opened as a file:// page, and
-       Google may block sign-in inside embedded Android WebViews.
+     - SIGN-IN METHOD PER ENVIRONMENT (chosen automatically by the app):
+         * https:// pages (GitHub Pages or any HTTPS host) .... Google Identity
+           Services popup. Add the exact origin to "Authorized JavaScript origins".
+         * http://localhost:PORT or http://127.0.0.1:PORT .... same popup flow;
+           add that exact origin (including the port) to "Authorized JavaScript
+           origins". (Origins must match exactly: localhost and 127.0.0.1 differ.)
+         * Android Studio WebView app .... Google blocks OAuth inside embedded
+           WebViews, so a small NATIVE BRIDGE is required (see below). Without it
+           the app keeps working offline exactly as before and explains the
+           limitation when the user taps "Connect to Google".
+         * file:// pages, plain http:// on a LAN/IP address, capacitor:// etc. ....
+           Google does not accept these origins for the web flow. Open the app
+           from https:// or http://localhost, or use the native bridge.
+     - NATIVE BRIDGE (wrapper apps; implemented in the native app, not in this file):
+         The page looks for window.ChurchDriveNative (a WebView JavascriptInterface)
+         with   requestAccessToken(scope, clientId, prompt)    [required]
+                revokeAccessToken(token)                       [optional]
+         The native code gets a Drive access token for the SAME scope using the
+         platform's own Google authorization API (Android:
+         Identity.getAuthorizationClient(activity).authorize(...) with an Android
+         OAuth client of the same Google Cloud project: package name + SHA-1), then
+         answers by running this in the WebView:
+           window.__churchDriveNativeAuth({ access_token: "...", expires_in: 3600,
+                                            scope: "<granted scopes>" })
+           window.__churchDriveNativeAuth({ error: "access_denied" })   // or any error text
+         The page accepts only an answer to a request it made itself and keeps the
+         token like a web token (memory + sessionStorage only, never in backups or
+         localStorage). No client secret is ever needed or stored in this file.
+     - BACKUP FOLDER LOCK: the backup folder name can be saved ONCE. After that it is
+       locked permanently (it cannot be edited, replaced or reset from the app), is
+       shown automatically on the Backup page, and is always the folder used for
+       backup and restore. Only if that folder is deleted/inaccessible can the app
+       re-link a folder with the SAME name (after confirmation).
      ===================================================================== -->
 <script>
 const GOOGLE_DRIVE_CONFIG = {
@@ -1182,7 +1212,9 @@ const GOOGLE_DRIVE_CONFIG = {
   AUTO_BACKUP_DEBOUNCE_MS: 5000,                                  // wait after last change before uploading
   RETRY_DELAYS_MS: [15000, 30000, 60000, 120000, 300000, 600000], // temporary-failure retries (last value repeats)
   REQUEST_TIMEOUT_MS: 30000,
-  SETTINGS_STORAGE_KEY: "churchOfferingBackupSettings.v1"         // local preferences (no tokens stored)
+  SETTINGS_STORAGE_KEY: "churchOfferingBackupSettings.v1",        // local preferences (no tokens stored)
+  FOLDER_LOCK_STORAGE_KEY: "churchOfferingBackupFolderLock.v1",   // permanent backup-folder lock (name + folder ID)
+  NATIVE_BRIDGE_NAME: "ChurchDriveNative"                         // optional Android/iOS WebView sign-in bridge (see notes above)
 };
 </script>
 
@@ -1216,14 +1248,47 @@ const GOOGLE_DRIVE_CONFIG = {
     var id = String(CFG.CLIENT_ID || '').trim();
     return /^[\w\-]+\.apps\.googleusercontent\.com$/i.test(id) && !/(PASTE|YOUR|REPLACE|XXXX)/i.test(id);
   }
-  function originSupported() {
-    var p = location.protocol, h = location.hostname;
-    return p === 'https:' || ((p === 'http:') && (h === 'localhost' || h === '127.0.0.1'));
-  }
+  /* Only a missing configuration disables the Drive section. Everything else (file://, WebView, LAN http...)
+     is judged when the user actually tries to connect, so the offline app is never blocked by it. */
   function envProblem() {
     if (!isConfigured()) return 'notConfigured';
-    if (!originSupported()) return 'origin';
     return null;
+  }
+  function nativeBridge() {
+    var n = window[CFG.NATIVE_BRIDGE_NAME];
+    return (n && typeof n.requestAccessToken === 'function') ? n : null;
+  }
+  function effectiveOrigin() {            /* the web origin Google would see; '' when the page has none (file://, sandbox...) */
+    try { var o = window.origin; if (o && o !== 'null') return o; } catch (e) {}
+    try { if (location.origin && location.origin !== 'null') return location.origin; } catch (e) {}
+    return '';
+  }
+  function isEmbeddedWebView() {
+    var ua = navigator.userAgent || '';
+    if (/; wv\)/.test(ua) || /\bwv\b/.test(ua)) return true;                       /* Android WebView */
+    if (/(iPhone|iPad|iPod)/.test(ua) && !/Safari\//.test(ua)) return true;       /* iOS WKWebView */
+    return false;
+  }
+  /* Which sign-in path can this environment use?  native bridge | web (Google Identity Services) | blocked (with reason) */
+  function authEnv() {
+    if (nativeBridge()) return { path: 'native' };
+    var o = effectiveOrigin(), tail = ' The app and all its data keep working normally on this device.';
+    if (!o) return { path: 'blocked', message: (location.protocol === 'file:' ? 'This page was opened as a local file (file://), which Google does not accept for sign-in.' : 'This page has no web address that Google can verify for sign-in.') +
+      ' To use Google Drive, open the app from its https:// address (for example GitHub Pages) or from http://localhost, or run it inside the Android app that provides the native Google sign-in bridge.' + tail };
+    var u; try { u = new URL(o); } catch (e) { return { path: 'web' }; }              /* unknown form: let Google decide */
+    if (u.protocol === 'https:') return { path: 'web' };
+    if (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]' || u.hostname === '::1')) return { path: 'web' };
+    if (u.protocol === 'http:') return { path: 'blocked', message: 'Google accepts only https:// addresses or http://localhost for sign-in, not plain http on “' + u.host + '”. Open the app through https:// or http://localhost.' + tail };
+    return { path: 'blocked', message: 'Google does not accept “' + u.protocol + '” pages for sign-in. Open the app from https:// or http://localhost, or use the native Google sign-in bridge.' + tail };
+  }
+  function authFailureHint(e) {           /* only used after a real connection attempt failed */
+    var k = e && e.kind;
+    if (isEmbeddedWebView() && !nativeBridge())
+      return ' Google does not allow sign-in inside an embedded Android/iOS WebView. The app needs the native sign-in bridge (window.' + CFG.NATIVE_BRIDGE_NAME + ', see the API configuration notes in index.html), or it can be opened in the device browser.';
+    if (k === 'popup') return '';
+    if (k === 'cancelled') return '';
+    var o = effectiveOrigin();
+    return o ? ' If Google showed an “origin_mismatch” or “invalid request” page, add ' + o + ' to the Authorized JavaScript origins of this OAuth Client ID.' : '';
   }
 
   /* ---------- persisted settings (no tokens, no secrets) ---------- */
@@ -1239,10 +1304,41 @@ const GOOGLE_DRIVE_CONFIG = {
     return s;
   }
   var settings = loadSettings();
-  function saveSettings(patch) {
-    for (var k in patch) settings[k] = patch[k];
+
+  /* ---------- permanent backup-folder lock (separate persistent key, survives refresh/restart) ---------- */
+  var LOCK_KEY = CFG.FOLDER_LOCK_STORAGE_KEY || 'churchOfferingBackupFolderLock.v1', lockMem = null;
+  function readLock() {
+    try {
+      var o = JSON.parse(localStorage.getItem(LOCK_KEY) || 'null');
+      if (o && typeof o.name === 'string' && o.name && typeof o.id === 'string' && o.id) return o;
+    } catch (e) {}
+    return null;
+  }
+  function getLock() { return readLock() || lockMem; }
+  function writeLock(name, id) {
+    var prev = getLock();
+    lockMem = { name: name, id: id, lockedAt: prev ? prev.lockedAt : Date.now() };
+    try { localStorage.setItem(LOCK_KEY, JSON.stringify(lockMem)); } catch (e) { storageOk = false; }
+  }
+  function saveSettings(patch, opts) {
+    var lock = getLock(), p = {}, k;
+    for (k in patch) p[k] = patch[k];
+    if (lock) {            /* locked: ordinary code paths can never change the folder name, nor point to another folder */
+      if ('folderName' in p) p.folderName = lock.name;
+      if ('folderId' in p && !(opts && opts.relink)) p.folderId = lock.id;
+    }
+    for (k in p) settings[k] = p[k];
     try { localStorage.setItem(CFG.SETTINGS_STORAGE_KEY, JSON.stringify(settings)); } catch (e) { storageOk = false; }
   }
+  function enforceLock() {
+    var lock = getLock();
+    if (!lock && settings.folderId && settings.folderName) { writeLock(settings.folderName, settings.folderId); lock = getLock(); }   /* folder saved before the lock existed becomes the locked folder */
+    if (lock && (settings.folderName !== lock.name || settings.folderId !== lock.id)) {
+      settings.folderName = lock.name; settings.folderId = lock.id;
+      try { localStorage.setItem(CFG.SETTINGS_STORAGE_KEY, JSON.stringify(settings)); } catch (e) { storageOk = false; }
+    }
+  }
+  enforceLock();
 
   /* ---------- runtime state ---------- */
   var state = {
@@ -1306,7 +1402,33 @@ const GOOGLE_DRIVE_CONFIG = {
       }
     });
   }
+  function requestTokenNative(prompt) {
+    return new Promise(function (resolve, reject) {
+      if (state.pendingAuth) return reject(new DriveError('auth', 'A Google sign-in is already in progress.'));
+      var timer = setTimeout(function () { settleAuth(new DriveError('timeout', 'Google sign-in did not respond.')); }, 120000);
+      state.pendingAuth = { resolve: resolve, reject: reject, timer: timer, native: true };
+      try { nativeBridge().requestAccessToken(CFG.SCOPES, CFG.CLIENT_ID.trim(), String(prompt || '')); }
+      catch (e) { settleAuth(new DriveError('unsupported', 'The app’s native Google sign-in could not start.')); }
+    });
+  }
+  /* Answer from the native app. Accepted ONLY as the reply to a request this page made. */
+  window.__churchDriveNativeAuth = function (result) {
+    var p = state.pendingAuth;
+    if (!p || !p.native) return;
+    var r = result;
+    if (typeof r === 'string') { try { r = JSON.parse(r); } catch (e) { r = null; } }
+    if (!r || typeof r !== 'object') return settleAuth(new DriveError('auth', 'The app returned an unreadable Google sign-in result.'));
+    if (r.error) {
+      var denied = /denied|cancel/i.test(String(r.error));
+      return settleAuth(new DriveError(denied ? 'cancelled' : 'auth', denied ? 'Google authorization was denied or cancelled.' : 'Google authorization failed (' + String(r.error).slice(0, 120) + ').'));
+    }
+    if (typeof r.access_token !== 'string' || !r.access_token) return settleAuth(new DriveError('auth', 'Google did not return an access token.'));
+    var sc = Array.isArray(r.scope) ? r.scope.join(' ') : String(r.scope || '');
+    if (sc && sc.indexOf(CFG.SCOPES) < 0) return settleAuth(new DriveError('auth', 'The required Google Drive permission was not granted.'));
+    settleAuth(null, r);
+  };
   function requestToken(prompt) {
+    if (nativeBridge()) return requestTokenNative(prompt);
     return new Promise(function (resolve, reject) {
       if (!gisReady()) return reject(new DriveError('unsupported', 'Google sign-in is not available.'));
       if (state.pendingAuth) return reject(new DriveError('auth', 'A Google sign-in is already in progress.'));
@@ -1417,10 +1539,15 @@ const GOOGLE_DRIVE_CONFIG = {
     } catch (e) { if (e.kind === 'notfound' || e.kind === 'forbidden') return false; throw e; }
   }
   async function verifyFolderOrThrow() {
+    var lock = getLock();
+    if (lock && (settings.folderId !== lock.id || settings.folderName !== lock.name)) {      /* identity check: never use any folder but the locked one */
+      state.folderStatus = 'missing';
+      throw new DriveError('folder', 'The backup folder setting does not match the locked folder “' + lock.name + '”. Nothing was backed up or restored, and no folder was created.');
+    }
     var ok = await folderIsUsable(settings.folderId);
     if (!ok) {
       state.folderStatus = 'missing';
-      throw new DriveError('folder', 'The saved backup folder “' + settings.folderName + '” was deleted or is no longer accessible. No new folder was created. Open Backup Folder and click Save Folder to choose or create one deliberately.');
+      throw new DriveError('folder', 'The locked backup folder “' + settings.folderName + '” was deleted or is no longer accessible. No new folder was created. Open the Backup page and tap “Reconnect Folder” to look for (or deliberately re-create) a folder with this same name.');
     }
     state.folderStatus = 'ok';
   }
@@ -1448,37 +1575,37 @@ const GOOGLE_DRIVE_CONFIG = {
   async function saveFolder() {
     if (state.busy) return;
     if (!isConnected()) { setError('Connect to Google first.'); return; }
-    var name = $id('bkFolderInput').value.trim();
-    var bad = validFolderName(name); if (bad) { setError(bad); return; }
+    var lock = getLock(), input = $id('bkFolderInput'), typed = input.value.trim();
+    if (lock && typed !== lock.name) {       /* locked: a different name is rejected, whatever the UI sent */
+      input.value = lock.name;
+      setError('The backup folder is permanently locked to “' + lock.name + '”. A different folder name cannot be saved.');
+      return;
+    }
+    var name = lock ? lock.name : typed;
+    var bad = lock ? '' : validFolderName(name); if (bad) { setError(bad); return; }
     state.busy = 'folder'; state.msg = ''; state.err = ''; render();
     try {
-      var reuseId = '';
-      if (settings.folderId) {
-        setMessage('Checking the saved folder…');
-        var usable = await folderIsUsable(settings.folderId);
-        if (usable && name === settings.folderName) {
+      if (lock) {
+        setMessage('Checking the locked folder…');
+        if (await folderIsUsable(settings.folderId)) {
           state.folderStatus = 'ok';
-          setMessage('Folder “' + settings.folderName + '” is already saved and accessible — it will be reused. No new folder was created.', 'ok');
+          setMessage('The locked folder “' + lock.name + '” is accessible and already in use. Nothing needs to change and no new folder was created.', 'ok');
           return;
         }
-        if (usable) {
-          if (!(await confirmDialog('Change backup folder?', 'Switch from “' + settings.folderName + '” to “' + name + '”? Existing backups in the old folder are not deleted or moved.', 'Change folder'))) {
-            $id('bkFolderInput').value = settings.folderName; setMessage('Folder not changed.'); return;
-          }
-        } else {
-          if (!(await confirmDialog('Saved folder not accessible', 'The saved folder “' + settings.folderName + '” was deleted or can no longer be accessed. Look for a folder named “' + name + '” and create it only if none exists?', 'Continue'))) {
-            setMessage('Nothing was created. The saved folder setting is unchanged.'); return;
-          }
+        if (!(await confirmDialog('Locked folder not accessible', 'The locked backup folder “' + lock.name + '” was deleted or can no longer be accessed. Look for a folder with the same name and create it only if none exists? The folder name stays the same.', 'Reconnect folder'))) {
+          setMessage('Nothing was created. The locked folder setting is unchanged.'); return;
         }
+      } else if (!(await confirmDialog('Lock this backup folder name?', '“' + name + '” will be saved as the only backup folder. After this, the name is locked permanently and cannot be edited, renamed, replaced or reset from the app.', 'Save and lock'))) {
+        setMessage('Folder not saved. You can still change the name.'); return;
       }
       setMessage('Looking for an existing folder named “' + name + '”…');
       var f = await findFolderByName(name), created = false;
-      if (f) reuseId = f.id;
-      else { setMessage('Creating folder “' + name + '”…'); f = await createFolder(name); reuseId = f.id; created = true; }
-      var changed = reuseId !== settings.folderId;
-      saveSettings({ folderId: reuseId, folderName: name, fileId: changed ? '' : settings.fileId, everBackedUp: changed ? false : settings.everBackedUp });
+      if (!f) { setMessage('Creating folder “' + name + '”…'); f = await createFolder(name); created = true; }
+      var changed = f.id !== settings.folderId;
+      saveSettings({ folderId: f.id, folderName: name, fileId: changed ? '' : settings.fileId, everBackedUp: changed ? false : settings.everBackedUp }, { relink: true });
+      writeLock(name, f.id);
       state.folderStatus = 'ok'; state.autoBlocked = '';
-      setMessage((created ? 'Folder “' + name + '” created and saved. ' : 'Existing folder “' + name + '” found and saved (no duplicate created). ') + 'It is used for both backup and restore.', 'ok');
+      setMessage((created ? 'Folder “' + name + '” created, saved and locked. ' : 'Existing folder “' + name + '” found, saved and locked (no duplicate created). ') + 'It is used for both backup and restore and cannot be changed.', 'ok');
     } catch (e) { reportError(e, 'Saving the folder failed'); }
     finally { state.busy = null; render(); resumeAuto(); }
   }
@@ -1759,7 +1886,9 @@ const GOOGLE_DRIVE_CONFIG = {
     state.msg = ''; state.err = '';
     if (envProblem()) { render(); return; }
     if (state.busy || isConnected()) return;
-    if (!gisReady()) {   /* must call requestAccessToken synchronously inside the click, so load first */
+    var env = authEnv();
+    if (env.path === 'blocked') { setError(env.message); return; }      /* a specific, known limitation that really prevents sign-in here */
+    if (env.path === 'web' && !gisReady()) {   /* must call requestAccessToken synchronously inside the click, so load first */
       setMessage('Loading Google sign-in… please click “Connect to Google” again in a moment.');
       loadGis().then(render).catch(function (e) { setError(e.message + ' You can keep using the app normally.'); });
       return;
@@ -1774,13 +1903,13 @@ const GOOGLE_DRIVE_CONFIG = {
       if (settings.folderId) {
         try {
           if (await folderIsUsable(settings.folderId)) { state.folderStatus = 'ok'; note = ' Backup folder “' + settings.folderName + '” is ready.'; }
-          else { state.folderStatus = 'missing'; note = ''; setError('Connected, but the saved folder “' + settings.folderName + '” is not accessible with this account' + (diff ? ' (a different account than before)' : '') + '. No new folder was created.'); return; }
+          else { state.folderStatus = 'missing'; note = ''; setError('Connected, but the locked folder “' + settings.folderName + '” is not accessible with this account' + (diff ? ' (a different account than before)' : '') + '. No new folder was created. Tap “Reconnect Folder” to look for a folder with the same name.'); return; }
         } catch (e) { note = ' (Could not verify the folder right now.)'; }
       }
       setMessage('Connected to Google' + (state.email ? ' as ' + state.email : '') + '.' + note, 'ok');
     }).catch(function (e) {
-      if (e && e.kind === 'cancelled') setMessage((e.message || 'Authorization cancelled.') + ' You are not connected.');
-      else reportError(e, 'Could not connect to Google');
+      if (e && e.kind === 'cancelled') setMessage((e.message || 'Authorization cancelled.') + ' You are not connected.' + authFailureHint(e));
+      else setError('Could not connect to Google: ' + ((e && e.message) || e) + authFailureHint(e));
     }).then(function () { state.busy = null; render(); resumeAuto(); });
   }
   function onDisconnectClick() {
@@ -1789,7 +1918,7 @@ const GOOGLE_DRIVE_CONFIG = {
     var tok = state.token;
     if (state.pendingAuth) settleAuth(new DriveError('cancelled', 'Cancelled.'));
     invalidateToken(); state.authExpired = false; state.silentBlocked = true; state.folderStatus = 'unknown';
-    try { if (tok && gisReady()) google.accounts.oauth2.revoke(tok, function () {}); } catch (e) {}
+    try { var nb = nativeBridge(); if (tok && nb && typeof nb.revokeAccessToken === 'function') nb.revokeAccessToken(tok); else if (tok && gisReady()) google.accounts.oauth2.revoke(tok, function () {}); } catch (e) {}
     setMessage('Disconnected from Google. No further Google Drive requests will be made. Your local records, the saved folder setting, and any backups already on Google Drive were kept.');
   }
   function onToggleChange(ev) {
@@ -1826,7 +1955,6 @@ const GOOGLE_DRIVE_CONFIG = {
     var tg = $id('bkAutoToggle'); tg.checked = !!settings.autoBackup; tg.disabled = !!problem;
     var cs = $id('bkConnStatus'), txt;
     if (problem === 'notConfigured') txt = '⚠️ Google Drive is not configured. The app works normally and all data stays on this device. (To enable backup, add a Google Client ID in the “GOOGLE DRIVE BACKUP — API CONFIGURATION” section of index.html.)';
-    else if (problem === 'origin') txt = '⚠️ Google sign-in is not available here: it needs the app to be opened from https:// (for example GitHub Pages) or http://localhost, not a local file. The app works normally and all data stays on this device.';
     else if (state.busy === 'connect') txt = 'Connecting to Google…';
     else if (connected) txt = '✅ Connected to Google' + (state.email ? ' as ' + state.email : '') + '.';
     else if (state.token || state.authExpired) txt = '⚠️ Your Google authorization expired (Google access lasts about an hour) or was revoked. Tap “Connect to Google” to renew it — your folder and settings are kept.';
@@ -1836,12 +1964,22 @@ const GOOGLE_DRIVE_CONFIG = {
     $id('bkConnectBtn').disabled = busy;
     show('bkDisconnectBtn', !problem && (connected || !!state.token));
     $id('bkDisconnectBtn').disabled = false;
-    show('bkFolderBox', !problem && connected);
-    $id('bkSaveFolderBtn').disabled = busy;
-    $id('bkFolderInput').disabled = busy;
-    if (!state.folderInputInit) { $id('bkFolderInput').value = settings.folderName || ''; state.folderInputInit = true; }
+    var lock = getLock(), lockedMissing = !!lock && state.folderStatus === 'missing';
+    show('bkFolderBox', !problem && (connected || !!lock));          /* saved folder name is always displayed, no searching needed */
+    var fIn = $id('bkFolderInput'), fBtn = $id('bkSaveFolderBtn');
+    show('bkSaveFolderBtn', !lock || (connected && lockedMissing));  /* locked: only offered to re-link the SAME name if the folder vanished */
+    fBtn.textContent = lock ? 'Reconnect Folder' : 'Save Folder';
+    fBtn.disabled = busy;
+    if (lock) {
+      fIn.value = lock.name; fIn.readOnly = true; fIn.disabled = false; fIn.style.background = '#f1f5f9'; fIn.setAttribute('aria-readonly', 'true');
+    } else {
+      fIn.readOnly = false; fIn.disabled = busy; fIn.style.background = ''; fIn.removeAttribute('aria-readonly');
+      if (!state.folderInputInit) { fIn.value = settings.folderName || ''; state.folderInputInit = true; }
+    }
     var fs = $id('bkFolderStatus');
-    fs.textContent = settings.folderId ? ('Saved folder: “' + settings.folderName + '”' + (state.folderStatus === 'missing' ? ' — ⚠️ not accessible' : '') + '. It is used for both backup and restore.') : 'No backup folder saved yet. Enter a name and click Save Folder.';
+    fs.textContent = lock
+      ? ('🔒 Backup folder: “' + lock.name + '” (locked — it cannot be changed). It is used for both backup and restore.' + (lockedMissing ? ' ⚠️ The folder is not accessible right now — tap “Reconnect Folder” to look for a folder with this same name.' : ''))
+      : 'No backup folder saved yet. Enter a name and click Save Folder. The name can be saved only once and is then locked permanently.';
     var ready = !problem && connected && !!settings.folderId;
     show('bkActions', ready);
     $id('bkManualBtn').disabled = busy || settings.autoBackup || !folderUsable();
@@ -1866,7 +2004,7 @@ const GOOGLE_DRIVE_CONFIG = {
   window.openBackupView = function () {
     switchView('backupView', null);
     render();
-    if (!envProblem() && !gisReady() && navigator.onLine !== false) loadGis().then(render).catch(function () { /* not fatal; shown when user clicks Connect */ });
+    if (!envProblem() && authEnv().path === 'web' && !gisReady() && navigator.onLine !== false) loadGis().then(render).catch(function () { /* not fatal; shown when user clicks Connect */ });
   };
 
   function init() {
@@ -1891,7 +2029,7 @@ const GOOGLE_DRIVE_CONFIG = {
         .then(function () { render(); resumeAuto(); });
     }
     /* Preload Google sign-in once (non-blocking) so the first Connect tap works immediately. */
-    if (!envProblem() && navigator.onLine !== false) setTimeout(function () { if (!gisReady()) loadGis().catch(function () {}); }, 1500);
+    if (!envProblem() && authEnv().path === 'web' && navigator.onLine !== false) setTimeout(function () { if (!gisReady()) loadGis().catch(function () {}); }, 1500);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();
